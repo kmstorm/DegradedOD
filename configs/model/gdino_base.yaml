@@ -1,0 +1,11 @@
+# Grounding DINO Base (SwinB backbone) configuration
+model_id: "IDEA-Research/grounding-dino-base"
+dtype: "float16"
+box_threshold: 0.25
+text_threshold: 0.20
+
+# Feature extraction hook targets
+hooks:
+  backbone: "model.backbone"
+  encoder: "model.encoder"
+  decoder: "model.decoder"

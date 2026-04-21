@@ -1,0 +1,53 @@
+# Phase B: Adaptation Module Training
+# Train Proposal Encoder + Refinement Module + Detection Head
+# using paired clean↔degraded data
+
+defaults:
+  - /model: modd_default
+  - /data: coco_clean
+
+phase: "module_training"
+
+# Degradation settings for synthetic pair generation
+degradation:
+  mode: "combined"                # "haze", "night", or "combined"
+  haze:
+    beta_range: [0.5, 2.0]
+    atm_light_range: [0.7, 1.0]
+  night:
+    gamma_range: [2.0, 4.0]
+    noise_sigma_range: [0.01, 0.05]
+
+# Training hyperparameters
+training:
+  epochs: 50
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+
+  # Loss weights
+  loss:
+    detection_weight: 1.0         # DETR-style box loss
+    contrastive_weight: 0.5       # feature alignment loss
+    retrieval_weight: 0.3         # retrieval quality loss
+
+  # Memory efficiency
+  gradient_checkpointing: true
+  mixed_precision: true           # FP16 training
+  gradient_accumulation_steps: 2
+
+  # Logging
+  log_interval: 50
+  eval_interval: 1                # evaluate every N epochs
+
+# Checkpointing
+checkpoint:
+  output_dir: "${oc.env:OUTPUT_ROOT,./outputs}/checkpoints"
+  save_top_k: 3
+  monitor: "val/mAP_50"
+  mode: "max"
+
+# Memory bank (pre-built)
+memory_bank_path: "${oc.env:OUTPUT_ROOT,./outputs}/memory_bank/index.faiss"

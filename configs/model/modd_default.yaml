@@ -1,0 +1,59 @@
+# MODD Full Pipeline Default Configuration
+
+# --- Backbone ---
+backbone:
+  model_id: "IDEA-Research/grounding-dino-base"
+  dtype: "float16"
+  box_threshold: 0.25
+  text_threshold: 0.20
+  frozen: true
+
+# --- Memory Bank ---
+memory_bank:
+  feature_dim: 256
+  max_entries_per_class: 1000
+  max_total_entries: 100000
+  index_type: "flat"       # "flat" (exact) or "ivf" (approximate)
+  similarity: "cosine"      # "cosine" or "inner_product"
+
+# --- Proposal Encoder ---
+proposal_encoder:
+  input_dim: 256            # G-DINO query feature dim (auto-detected at runtime)
+  hidden_dim: 512
+  output_dim: 256           # must match memory_bank.feature_dim
+  num_layers: 2
+  dropout: 0.1
+
+# --- Memory Retrieval ---
+retrieval:
+  top_k: 8
+  temperature: 0.07          # learnable softmax temperature
+  class_restricted: true     # restrict retrieval to same predicted class
+
+# --- Refinement Module ---
+refinement:
+  num_layers: 2
+  d_model: 256
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.1
+
+# --- Detection Head ---
+detection_head:
+  input_dim: 256
+  hidden_dim: 256
+  num_classes: null          # set per-dataset, or null for class-agnostic refinement
+  num_box_params: 4          # xyxy
+
+# --- Memory Update ---
+memory_update:
+  enabled: true
+  confidence_threshold: 0.7
+  ema_momentum: 0.99
+  max_queue_size: 1000
+
+# --- Confidence Gating ---
+confidence_gating:
+  high_threshold: 0.5       # above this → direct output (skip retrieval)
+  low_threshold: 0.15       # below this → discard
+  # between low and high → route through memory retrieval + refinement

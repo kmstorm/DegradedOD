@@ -1,0 +1,20 @@
+# Phase A: Memory Bank Construction
+# Run frozen G-DINO on clean data, extract features, build FAISS index
+
+defaults:
+  - /model: gdino_base
+  - /data: coco_clean
+
+phase: "memory_construction"
+
+memory:
+  output_dir: "${oc.env:OUTPUT_ROOT,./outputs}/memory_bank"
+  feature_source: "encoder"       # which hook: "backbone", "encoder", "decoder"
+  min_detection_score: 0.4        # only store features from confident detections
+  max_images: null                # null = process all, or int for debugging
+  save_interval: 1000             # save checkpoint every N images
+
+  # FAISS index config
+  index:
+    type: "flat"                  # exact search for bank construction
+    normalize: true               # L2-normalize for cosine similarity

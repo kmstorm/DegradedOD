@@ -1,0 +1,39 @@
+# Phase C: End-to-End Fine-tuning (Optional)
+# Joint training of all trainable modules
+
+defaults:
+  - /model: modd_default
+  - /data: coco_clean
+
+phase: "finetune"
+
+# Inherits degradation from phase_b
+degradation:
+  mode: "combined"
+
+training:
+  epochs: 20
+  batch_size: 2                   # smaller batch due to full pipeline
+  learning_rate: 1.0e-5           # lower LR for fine-tuning
+  weight_decay: 1.0e-4
+  lr_scheduler: "cosine"
+  warmup_epochs: 2
+
+  loss:
+    detection_weight: 1.0
+    contrastive_weight: 0.3
+    retrieval_weight: 0.2
+
+  gradient_checkpointing: true
+  mixed_precision: true
+  gradient_accumulation_steps: 4
+
+# Load from Phase B checkpoint
+resume_from: "${oc.env:OUTPUT_ROOT,./outputs}/checkpoints/best_phase_b.ckpt"
+memory_bank_path: "${oc.env:OUTPUT_ROOT,./outputs}/memory_bank/index.faiss"
+
+checkpoint:
+  output_dir: "${oc.env:OUTPUT_ROOT,./outputs}/checkpoints"
+  save_top_k: 3
+  monitor: "val/mAP_50"
+  mode: "max"

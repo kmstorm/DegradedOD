@@ -1,0 +1,29 @@
+# Data & Checkpoints
+data/
+datasets/
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Experiment outputs
+outputs/
+logs/
+wandb/
+mlruns/
+lightning_logs/
+
+# Environment
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# System
+.DS_Store
+*.swp
+
+# Scratch (agent state)
+scratch/

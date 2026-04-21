@@ -1,0 +1,10 @@
+# Grounding DINO Tiny (SwinT backbone) — lightweight variant
+model_id: "IDEA-Research/grounding-dino-tiny"
+dtype: "float16"
+box_threshold: 0.25
+text_threshold: 0.20
+
+hooks:
+  backbone: "model.backbone"
+  encoder: "model.encoder"
+  decoder: "model.decoder"
