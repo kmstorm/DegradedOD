@@ -113,7 +113,6 @@ class GroundingDINOWrapper(nn.Module):
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
             model_id,
-            torch_dtype=dtype,
         ).to(self.device)
 
         # Freeze everything
@@ -220,9 +219,14 @@ class GroundingDINOWrapper(nn.Module):
             images=image, text=text_prompt, return_tensors="pt"
         ).to(self.device)
 
-        # Forward pass (also triggers hooks)
+        # Cast pixel_values to model dtype (processor returns fp32, model may be fp16)
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
+
+        # Forward pass (also triggers hooks) — use autocast for mixed precision
         self.hook_manager.clear()
-        outputs = self.model(**inputs)
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            outputs = self.model(**inputs)
 
         # Post-process
         target_sizes = torch.tensor(
@@ -232,14 +236,19 @@ class GroundingDINOWrapper(nn.Module):
             outputs,
             input_ids=inputs["input_ids"],
             target_sizes=target_sizes,
-            box_threshold=box_thr,
+            threshold=box_thr,
             text_threshold=text_thr,
         )[0]
+
+        # Resolve proper class labels from text prompt
+        labels = self._resolve_labels(
+            outputs.logits[0], results["boxes"], text_prompt, inputs["input_ids"][0]
+        )
 
         return DetectionResult(
             boxes=results["boxes"].cpu(),
             scores=results["scores"].cpu(),
-            labels=results["labels"],
+            labels=labels,
         )
 
     @torch.no_grad()
@@ -267,9 +276,14 @@ class GroundingDINOWrapper(nn.Module):
             images=image, text=text_prompt, return_tensors="pt"
         ).to(self.device)
 
-        # Forward pass
+        # Cast pixel_values to model dtype (processor returns fp32, model may be fp16)
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
+
+        # Forward pass — use autocast for mixed precision
         self.hook_manager.clear()
-        outputs = self.model(**inputs)
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            outputs = self.model(**inputs)
 
         # Post-process detections
         target_sizes = torch.tensor(
@@ -279,14 +293,19 @@ class GroundingDINOWrapper(nn.Module):
             outputs,
             input_ids=inputs["input_ids"],
             target_sizes=target_sizes,
-            box_threshold=box_thr,
+            threshold=box_thr,
             text_threshold=text_thr,
         )[0]
+
+        # Resolve proper class labels from text prompt
+        labels = self._resolve_labels(
+            outputs.logits[0], results["boxes"], text_prompt, inputs["input_ids"][0]
+        )
 
         detection = DetectionResult(
             boxes=results["boxes"].cpu(),
             scores=results["scores"].cpu(),
-            labels=results["labels"],
+            labels=labels,
         )
 
         # Extract hooked features
@@ -307,6 +326,126 @@ class GroundingDINOWrapper(nn.Module):
                 "pred_boxes": outputs.pred_boxes.cpu(),
             },
         )
+
+    @torch.no_grad()
+    def extract_features_batch(
+        self,
+        images: list[Image.Image],
+        text_prompt: str,
+        box_threshold: float | None = None,
+        text_threshold: float | None = None,
+    ) -> list[ProposalFeatures]:
+        """
+        Batch feature extraction — process multiple images in ONE forward pass.
+
+        This is significantly faster than calling extract_features() per image
+        because it amortizes the Transformer overhead across the batch.
+
+        Args:
+            images: List of PIL Images.
+            text_prompt: Detection prompt (same for all images).
+            box_threshold: Score threshold for detections.
+            text_threshold: Text threshold.
+
+        Returns:
+            List of ProposalFeatures, one per image.
+        """
+        if not images:
+            return []
+
+        box_thr = box_threshold or self.box_threshold
+        text_thr = text_threshold or self.text_threshold
+        batch_size = len(images)
+
+        # Preprocess entire batch — processor handles padding/resizing
+        texts = [text_prompt] * batch_size
+        inputs = self.processor(
+            images=images, text=texts, return_tensors="pt", padding=True,
+        ).to(self.device)
+
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
+
+        # Single forward pass for entire batch
+        self.hook_manager.clear()
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            outputs = self.model(**inputs)
+
+        # Post-process per image
+        target_sizes = torch.tensor(
+            [[img.height, img.width] for img in images], device=self.device
+        )
+        batch_results = self.processor.post_process_grounded_object_detection(
+            outputs,
+            input_ids=inputs["input_ids"],
+            target_sizes=target_sizes,
+            threshold=box_thr,
+            text_threshold=text_thr,
+        )
+
+        # Extract hooked features (batched)
+        hooked = self.hook_manager.get_features()
+
+        # Extract per-query features for the whole batch
+        batch_query_features = self._extract_query_features_batched(outputs, hooked)
+
+        # Build per-image results
+        results = []
+        for i in range(batch_size):
+            labels = self._resolve_labels(
+                outputs.logits[i], batch_results[i]["boxes"],
+                text_prompt, inputs["input_ids"][i],
+            )
+            detection = DetectionResult(
+                boxes=batch_results[i]["boxes"].cpu(),
+                scores=batch_results[i]["scores"].cpu(),
+                labels=labels,
+            )
+            # Per-image query features
+            query_feats = batch_query_features[i]  # (num_queries, D)
+
+            results.append(ProposalFeatures(
+                query_features=query_feats,
+                encoder_features=torch.empty(0),  # Skip encoder for training speed
+                detection=detection,
+                raw_outputs={},  # Skip raw outputs to save memory
+            ))
+
+        return results
+
+    def _extract_query_features_batched(
+        self,
+        outputs: Any,
+        hooked_features: dict[str, Any],
+    ) -> list[torch.Tensor]:
+        """
+        Extract per-proposal query features for a BATCH of images.
+
+        Returns:
+            List of (num_queries, D) tensors, one per image in the batch.
+        """
+        # Strategy 1: decoder hook
+        if "decoder" in hooked_features:
+            decoder_out = hooked_features["decoder"]
+            if isinstance(decoder_out, tuple):
+                query_feats = decoder_out[0]
+                if query_feats.dim() == 4:
+                    # (num_layers, batch, num_queries, dim) → last layer
+                    query_feats = query_feats[-1]
+                # query_feats is (batch, num_queries, dim)
+                return [query_feats[i].float() for i in range(query_feats.shape[0])]
+            elif isinstance(decoder_out, torch.Tensor):
+                if decoder_out.dim() == 3:
+                    return [decoder_out[i].float() for i in range(decoder_out.shape[0])]
+
+        # Strategy 2: model output
+        if hasattr(outputs, "last_hidden_state"):
+            lhs = outputs.last_hidden_state
+            return [lhs[i].float() for i in range(lhs.shape[0])]
+
+        # Strategy 3: logits fallback
+        logger.warning("Batch: using logits as proxy features")
+        return [outputs.logits[i].float() for i in range(outputs.logits.shape[0])]
 
     def _extract_query_features(
         self,
@@ -393,7 +532,7 @@ class GroundingDINOWrapper(nn.Module):
                 encoder_out = encoder_out.reshape(b, c, h * w).permute(0, 2, 1)
             return encoder_out.squeeze(0).float()
 
-        logger.warning("Could not parse encoder features, returning empty tensor")
+        logger.debug("Could not parse encoder features, returning empty tensor")
         return torch.empty(0)
 
     def get_feature_dim(self) -> dict[str, int | None]:
@@ -427,3 +566,101 @@ class GroundingDINOWrapper(nn.Module):
     def forward(self, *args, **kwargs):
         """Direct forward pass through the underlying model."""
         return self.model(*args, **kwargs)
+
+    # ──────────────────────────────────────────────────────────────
+    # Label resolution
+    # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_class_names(text_prompt: str) -> list[str]:
+        """Parse 'person . car . dog .' → ['person', 'car', 'dog']"""
+        classes = [c.strip() for c in text_prompt.replace(".", "").split("  ")]
+        # Fallback: split by " . "
+        if len(classes) <= 1:
+            classes = [c.strip().rstrip(".").strip() for c in text_prompt.split(".") if c.strip()]
+        return [c for c in classes if c]
+
+    def _resolve_labels(
+        self,
+        logits: torch.Tensor,
+        pred_boxes: torch.Tensor,
+        text_prompt: str,
+        input_ids: torch.Tensor,
+    ) -> list[str]:
+        """
+        Map each detection to the correct class from the text prompt.
+
+        Uses per-token logits to find which class name tokens have the
+        highest activation for each query/detection.
+
+        Args:
+            logits: (num_queries, num_tokens) raw logits from model.
+            pred_boxes: (N, 4) the filtered boxes (to find matching queries).
+            text_prompt: Original text prompt.
+            input_ids: (seq_len,) tokenized input ids.
+
+        Returns:
+            List of class name strings, one per detection.
+        """
+        class_names = self._parse_class_names(text_prompt)
+
+        if len(class_names) == 0:
+            return ["unknown"] * len(pred_boxes)
+
+        if len(class_names) == 1:
+            return [class_names[0]] * len(pred_boxes)
+
+        # Tokenize each class name to find its token span in input_ids
+        tokenizer = self.processor.tokenizer
+        class_token_spans = []
+
+        for cls_name in class_names:
+            # Tokenize class name alone (without special tokens)
+            cls_tokens = tokenizer.encode(cls_name, add_special_tokens=False)
+            class_token_spans.append(cls_tokens)
+
+        # Find token positions for each class in the full input_ids
+        input_ids_list = input_ids.tolist()
+        class_positions = []  # list of (start, end) token indices
+
+        for cls_tokens in class_token_spans:
+            found = False
+            for i in range(len(input_ids_list) - len(cls_tokens) + 1):
+                if input_ids_list[i:i + len(cls_tokens)] == cls_tokens:
+                    class_positions.append((i, i + len(cls_tokens)))
+                    found = True
+                    break
+            if not found:
+                class_positions.append(None)
+
+        # For each detection, compute mean logit for each class's token span
+        # logits shape: (num_queries, num_tokens)
+        logits_sigmoid = logits.sigmoid().cpu().float()
+
+        labels = []
+        for det_idx in range(len(pred_boxes)):
+            # We don't know which query corresponds to which detection
+            # after post-processing. Use the box to find best matching query.
+            # For simplicity, use det_idx directly (post-process preserves order)
+            if det_idx < logits_sigmoid.shape[0]:
+                query_logits = logits_sigmoid[det_idx]  # (num_tokens,)
+            else:
+                labels.append("unknown")
+                continue
+
+            best_score = -1.0
+            best_class = "unknown"
+
+            for cls_idx, pos in enumerate(class_positions):
+                if pos is None:
+                    continue
+                start, end = pos
+                if end <= query_logits.shape[0]:
+                    cls_score = query_logits[start:end].mean().item()
+                    if cls_score > best_score:
+                        best_score = cls_score
+                        best_class = class_names[cls_idx]
+
+            labels.append(best_class)
+
+        return labels

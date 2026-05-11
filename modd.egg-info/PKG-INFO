@@ -1,0 +1,139 @@
+Metadata-Version: 2.4
+Name: modd
+Version: 0.1.0
+Summary: Memory-Augmented Open-World Detection for Degraded Conditions
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1.0
+Requires-Dist: torchvision>=0.16.0
+Requires-Dist: transformers>=4.36.0
+Requires-Dist: faiss-cpu>=1.7.4
+Requires-Dist: hydra-core>=1.3.0
+Requires-Dist: albumentations>=1.3.0
+Requires-Dist: pycocotools>=2.0.7
+Requires-Dist: wandb>=0.16.0
+Requires-Dist: torchmetrics>=1.2.0
+Requires-Dist: einops>=0.7.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: opencv-python>=4.8.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+
+# MODD: Memory-Augmented Open-World Detection for Degraded Conditions
+
+> Retrieval-augmented object detection that leverages associative memory to
+> bridge the domain gap between clean and degraded visual conditions.
+
+## Overview
+
+MODD uses a frozen **Grounding DINO** open-world detector as the backbone and
+adds lightweight trainable modules (~8M params) that retrieve clean-domain
+knowledge from an associative memory bank to refine degraded proposals.
+
+**Key idea:** Foundation models produce lower-confidence detections under
+degradation. We use this uncertainty signal to trigger memory retrieval,
+pulling clean-domain prototypes that refine the degraded features via
+cross-attention — without retraining the foundation model.
+
+## Architecture
+
+```
+Degraded Image → Frozen G-DINO → Initial Proposals → Confidence Split
+                                                         ↓
+                                        Low-conf proposals → Proposal Encoder
+                                                              → Memory Retrieval (FAISS k-NN)
+                                                              → Refinement (Cross-Attention)
+                                                              → Refined Detection Head
+                                                         ↓
+                                              Merge with high-conf → Final Detections
+                                                         ↓
+                                              Memory Update (EMA) → Memory Bank
+```
+
+**5 Core Modules:**
+1. **Memory Bank** — FAISS-backed clean-domain feature storage (class prototypes + instance supports)
+2. **Proposal Encoder** — Projects G-DINO query features into retrieval space (~1.5M params)
+3. **Memory Retrieval** — Cosine k-NN search with learnable temperature
+4. **Refinement Module** — 2-layer Transformer decoder with cross-attention (~6M params)
+5. **Memory Update** — Online EMA insertion of high-confidence target features
+
+## Project Structure
+
+```
+├── configs/          # Hydra YAML configs (model, data, training phases)
+├── src/
+│   ├── models/       # All 5 modules + G-DINO wrapper + full pipeline
+│   ├── data/         # Degradation synthesis + dataset adapters
+│   ├── training/     # Losses, trainer, LR schedulers
+│   └── utils/        # Hooks, visualization, metrics
+├── scripts/          # Memory construction, training, evaluation, demo
+└── tests/            # Unit tests for each module
+```
+
+## Quick Start
+
+### Install
+```bash
+pip install -e ".[dev]"
+```
+
+### Phase A: Build Memory Bank
+```bash
+python scripts/build_memory_bank.py \
+    --config configs/train/phase_a_memory.yaml \
+    --max-images 1000
+```
+
+### Phase B: Train Adaptation Modules
+```bash
+python scripts/train_modules.py \
+    --config configs/train/phase_b_modules.yaml
+```
+
+### Evaluate
+```bash
+python scripts/evaluate.py \
+    --config configs/data/foggy_cityscapes.yaml \
+    --checkpoint outputs/checkpoints/best.ckpt
+```
+
+## Hardware Requirements
+
+| Setup | VRAM | Notes |
+|:---|:---|:---|
+| Inference only | ~8 GB | Frozen G-DINO base + modules |
+| Training (Phase B) | ~14-16 GB | With gradient checkpointing + FP16 |
+| Recommended | **RTX 3090 (24 GB)** | Comfortable for all phases |
+
+## Degradation Types
+
+| Type | Method | Parameters |
+|:---|:---|:---|
+| **Haze/Fog** | Koschmieder atmospheric scattering | β ∈ [0.5, 2.0], A ∈ [0.7, 1.0] |
+| **Night/Low-light** | Gamma correction + Poisson/Gaussian noise | γ ∈ [2.0, 4.0], σ ∈ [0.01, 0.05] |
+| **Combined** | Stochastic composition | Random mix of above |
+
+## Benchmarks
+
+| Dataset | Degradation | Protocol |
+|:---|:---|:---|
+| Foggy Cityscapes | Synthetic haze | Clean Cityscapes → Foggy |
+| RTTS | Real-world haze | COCO → RTTS |
+| ExDark | Real-world night | COCO → ExDark |
+| BDD100K-night | Real night driving | BDD-day → BDD-night |
+
+## Citation
+
+```
+@misc{modd2026,
+  title={MODD: Memory-Augmented Open-World Detection for Degraded Conditions},
+  year={2026},
+}
+```
+
+## License
+
+MIT

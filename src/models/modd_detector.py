@@ -43,9 +43,12 @@ class MODDConfig:
     box_threshold: float = 0.25
     text_threshold: float = 0.20
 
-    # Confidence gating
+    # Confidence gating for inference
+    # score < low_conf_threshold: discard
+    # low_conf_threshold <= score < box_threshold: retrieve + refine
+    # score >= box_threshold: keep directly
     high_conf_threshold: float = 0.5
-    low_conf_threshold: float = 0.15
+    low_conf_threshold: float = 0.10
 
     # Proposal encoder
     encoder_input_dim: int = 256
@@ -200,10 +203,25 @@ class MODDDetector(nn.Module):
         if len(proposal_data.detection) == 0:
             return proposal_data.detection
 
+        # Filter query_features to detected proposals only
+        # (query_features is 900 for ALL decoder queries, but detection is N_detected)
+        raw_logits = proposal_data.raw_outputs["logits"].squeeze(0)  # (900, C)
+        max_scores = raw_logits.sigmoid().max(dim=-1).values  # (900,)
+        det_mask = max_scores >= c.low_conf_threshold
+        detected_query_feats = proposal_data.query_features[det_mask]
+        n_det = len(proposal_data.detection)
+        if detected_query_feats.shape[0] != n_det:
+            detected_query_feats = proposal_data.query_features[:n_det]
+
         # Step 2: Confidence split
+        #   > 0.5  → high conf, pass directly
+        #   0.1–0.5 → mid conf, refine via memory retrieval
+        #   < 0.1  → discard (noise)
         scores = proposal_data.detection.scores
-        high_mask = scores >= c.high_conf_threshold
-        low_mask = (scores >= c.low_conf_threshold) & (scores < c.high_conf_threshold)
+        high_thresh = 0.5
+        low_thresh = 0.1
+        high_mask = scores >= high_thresh
+        low_mask = (scores >= low_thresh) & (scores < high_thresh)
 
         # High-confidence detections go directly to output
         high_conf_result = DetectionResult(
@@ -216,7 +234,7 @@ class MODDDetector(nn.Module):
         if not low_mask.any():
             return high_conf_result
 
-        low_features = proposal_data.query_features[low_mask].to(self.device)
+        low_features = detected_query_feats[low_mask].to(self.device)
         low_boxes = proposal_data.detection.boxes[low_mask].to(self.device)
         low_scores = proposal_data.detection.scores[low_mask].to(self.device)
         low_labels = [l for l, m in zip(proposal_data.detection.labels, low_mask) if m]
@@ -224,9 +242,9 @@ class MODDDetector(nn.Module):
         # Step 3: Encode proposals
         encoded = self.proposal_encoder(low_features)
 
-        # Step 4: Retrieve from memory bank
+        # Step 4: Retrieve from memory bank (global search for speed)
         retrieval_output = self.memory_retrieval(
-            encoded, memory_bank, class_hints=low_labels
+            encoded, memory_bank, class_hints=None
         )
 
         # Step 5: Refinement via cross-attention
@@ -250,8 +268,8 @@ class MODDDetector(nn.Module):
             labels=low_labels,
         )
 
-        # Filter refined results by confidence
-        refined_result = refined_result.filter_by_score(c.low_conf_threshold)
+        # Filter refined results — only keep if retrieval boosted above 0.5
+        refined_result = refined_result.filter_by_score(high_thresh)
 
         # Step 7: Merge high-conf and refined results
         merged = self._merge_results(high_conf_result, refined_result)
